@@ -15,7 +15,7 @@ import fetch from 'node-fetch';
 import FormData from 'form-data';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import mongoose from 'mongoose';
+import { Client } from 'pg';
 import dotenv from 'dotenv';
 import mime from 'mime-types';
 
@@ -27,23 +27,45 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
-
-const shareSchema = new mongoose.Schema({
-  name: String,
-  khodam: String,
-  photoUrl: String,
-  shareId: String
+// Setup PostgreSQL client
+const client = new Client({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
-const viewSchema = new mongoose.Schema({
-  totalViews: { type: Number, default: 0 }
-});
+client.connect()
+  .then(() => console.log('PostgreSQL connected'))
+  .catch(err => console.error('PostgreSQL connection error:', err));
 
-const Share = mongoose.model('Share', shareSchema);
-const View = mongoose.model('View', viewSchema);
+// Ensure tables exist
+const ensureTablesExist = async () => {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS shares (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255),
+      khodam VARCHAR(255),
+      photo_url TEXT,
+      share_id VARCHAR(255)
+    )
+  `);
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS views (
+      id SERIAL PRIMARY KEY,
+      total_views INT DEFAULT 0
+    )
+  `);
+
+  // Ensure there's one row in views table
+  const res = await client.query('SELECT * FROM views');
+  if (res.rows.length === 0) {
+    await client.query('INSERT INTO views (total_views) VALUES (0)');
+  }
+};
+
+ensureTablesExist();
 
 const tmpDir = './tmp';
 if (!fs.existsSync(tmpDir)) {
@@ -79,19 +101,16 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 app.use(async (req, res, next) => {
-  let viewData = await View.findOne();
-  if (!viewData) {
-    viewData = new View();
-    await viewData.save();
-  }
+  const result = await client.query('SELECT * FROM views LIMIT 1');
+  let viewData = result.rows[0];
 
   if (!req.cookies.viewed) {
-    viewData.totalViews += 1;
-    await viewData.save();
+    await client.query('UPDATE views SET total_views = total_views + 1 WHERE id = $1', [viewData.id]);
     res.cookie('viewed', 'true', { maxAge: 24 * 60 * 60 * 1000 });
+    viewData.total_views += 1;
   }
 
-  res.locals.totalViews = viewData.totalViews;
+  res.locals.totalViews = viewData.total_views;
   next();
 });
 
@@ -137,10 +156,19 @@ app.post('/submit', upload.single('photo'), async (req, res) => {
       const randomKhodam = khodams[Math.floor(Math.random() * khodams.length)];
 
       const shareId = crypto.randomBytes(3).toString('hex');
-      const newShare = new Share({ name, khodam: randomKhodam, photoUrl, shareId });
-      await newShare.save();
+      const newShare = {
+        name,
+        khodam: randomKhodam,
+        photo_url: photoUrl,
+        share_id: shareId
+      };
 
-      res.json({ name, khodam: randomKhodam, photoUrl, shareId });
+      await client.query(
+        'INSERT INTO shares (name, khodam, photo_url, share_id) VALUES ($1, $2, $3, $4)',
+        [newShare.name, newShare.khodam, newShare.photo_url, newShare.share_id]
+      );
+
+      res.json({ name, khodam: randomKhodam, photoUrl: photoUrl, shareId });
     });
   } catch (error) {
     res.status(500).send('Failed to upload photo');
@@ -148,7 +176,8 @@ app.post('/submit', upload.single('photo'), async (req, res) => {
 });
 
 app.get('/share/:id', async (req, res) => {
-  const shareData = await Share.findOne({ shareId: req.params.id });
+  const result = await client.query('SELECT * FROM shares WHERE share_id = $1', [req.params.id]);
+  const shareData = result.rows[0];
 
   if (!shareData) {
     return res.status(404).send('Not Found');
@@ -158,7 +187,8 @@ app.get('/share/:id', async (req, res) => {
 });
 
 app.get('/share-data/:id', async (req, res) => {
-  const shareData = await Share.findOne({ shareId: req.params.id });
+  const result = await client.query('SELECT * FROM shares WHERE share_id = $1', [req.params.id]);
+  const shareData = result.rows[0];
 
   if (!shareData) {
     return res.status(404).send('Not Found');
@@ -168,8 +198,9 @@ app.get('/share-data/:id', async (req, res) => {
 });
 
 app.get('/total-views', async (req, res) => {
-  const viewData = await View.findOne();
-  res.json({ totalViews: viewData.totalViews });
+  const result = await client.query('SELECT * FROM views LIMIT 1');
+  const viewData = result.rows[0];
+  res.json({ totalViews: viewData.total_views });
 });
 
 app.use((req, res, next) => {
